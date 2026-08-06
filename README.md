@@ -14,14 +14,24 @@ right in the conversation, scrolling with the transcript like any other tool
 output.
 
 ```
-ccimg [-v] <image> [cols]
+ccimg [-v] [--direct] [--no-sweep] <image> [cols]
 ```
 
 - `<image>` — any format Pillow can open (PNG, JPEG, GIF, WebP, ...)
 - `[cols]` — optional width in terminal cells; default fits the terminal
   and the image's native size, whichever is smaller
 - `-v` (or `CCIMG_DEBUG=1`) — print a diagnostic line (source size, cell
-  geometry, image id, target pty)
+  geometry, image id, transmission medium, target pty)
+- `--direct` (or `CCIMG_DIRECT=1`) — transmit the PNG in-band as chunked
+  base64 instead of via temp file, for terminals without file-transmission
+  support
+- `--no-sweep` (or `CCIMG_NO_SWEEP=1`) — skip the repaint sweep that runs
+  by default shortly after each render (`CCIMG_SWEEP_MS`, default 500): a
+  detached one-column winsize jiggle that makes the TUI replay its output,
+  clearing stray fragments an upstream Claude Code repaint bug
+  ([#17519](https://github.com/anthropics/claude-code/issues/17519),
+  [#84297](https://github.com/anthropics/claude-code/issues/84297))
+  sometimes leaves near tall output
 
 ## Requirements
 
@@ -57,9 +67,15 @@ two tricks, one per direction:
 
 1. **Pixels reach the terminal behind the TUI's back.** The script finds
    the Claude Code process by walking `/proc` ancestry, reads its stdin
-   pty, and writes the (downscaled) PNG to that pty directly via kitty
-   graphics APC escapes — invisible and cursor-neutral, transmitted in
-   quiet mode (`q=2`) so terminal responses don't land in Claude's stdin.
+   pty, and hands the (downscaled) PNG to the terminal via a kitty
+   graphics APC escape written to that pty — invisible and cursor-neutral,
+   in quiet mode (`q=2`) so terminal responses don't land in Claude's
+   stdin. By default the PNG travels as a temp file
+   (`/tmp/tty-graphics-protocol-*`, deleted by the terminal after
+   reading), so the pty carries only one small atomic escape rather than
+   hundreds of KB of base64 racing the TUI's own concurrent writes;
+   `--direct` / `CCIMG_DIRECT=1` switches back to chunked in-band
+   transmission for terminals without file support.
 2. **Placement travels through the TUI as plain text.** What `ccimg`
    prints to stdout — the part Claude Code captures as tool output — is a
    block of `U+10EEEE` placeholder characters with row/column combining

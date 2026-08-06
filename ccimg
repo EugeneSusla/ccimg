@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """ccimg — render an image inline in the current Claude Code transcript.
 
-Usage: ccimg [-v] <image> [cols]
+Usage: ccimg [-v] [--direct] [--no-sweep] <image> [cols]
+
+Sweep (on by default; --no-sweep / CCIMG_NO_SWEEP=1 disables): detached
+follow-up repaint — CCIMG_SWEEP_MS (default 500) after exit, jiggle the
+pty winsize (cols-1, restore) so Claude Code's renderer does a full
+model-consistent replay, clearing any stray fragments its skip-unchanged
+repaints left on screen (upstream bug, see README).
 
 -v (or CCIMG_DEBUG=1) prints a diagnostic line (size, cells, id, pty);
 default output is the placeholder block only.
@@ -12,8 +18,11 @@ Mechanism (kitty graphics protocol, unicode placeholders — verified in ghostty
      the claude process can restart mid-session and its old pty gets recycled
      to a DIFFERENT window — a stale path paints into someone else's terminal.
   2. Query TIOCGWINSZ on that pty for cell-grid + pixel geometry.
-  3. Transmit the (downscaled) PNG over the pty via APC escapes (invisible,
-     cursor-neutral), then create a virtual placement (U=1, aspect-fit).
+  3. Write the (downscaled) PNG to a temp file and send one small APC escape
+     naming it (t=t; invisible, cursor-neutral), then create a virtual
+     placement (U=1, aspect-fit). --direct / CCIMG_DIRECT=1 instead streams
+     the PNG base64 over the pty in chunks (t=d) — for terminals without
+     file transmission or ones that cannot read this machine's /tmp.
   4. Print the placeholder block (U+10EEEE + row/col diacritics, image ID in
      truecolor fg) to STDOUT. Ink renders it as ordinary tool output; ghostty
      maps the cells to the image. Cells scroll with the transcript.
@@ -30,7 +39,9 @@ import math
 import os
 import struct
 import sys
+import tempfile
 import termios
+import time
 
 from PIL import Image, ImageOps
 
@@ -134,6 +145,47 @@ def winsz(pty):
     return rows, cols, xpix, ypix
 
 
+def finish_sweep(fd, rows, cols, xp, yp):
+    """Restore the real winsize — unless someone else (a genuine window
+    resize) already changed it away from our jiggled value."""
+    cur = struct.unpack(
+        "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+    if cur[0] == rows and cur[1] == cols - 1:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, xp, yp))
+
+
+def spawn_sweep(pty, delay_ms):
+    """Detached repaint sweep: after delay_ms, set the pty winsize to cols-1
+    and restore it. Each change raises SIGWINCH in Claude Code, whose resize
+    path does a full replay repaint — clearing stray fragments left by its
+    skip-unchanged row reuse (upstream bug; see README). Width, not height:
+    a one-row jiggle visibly bounces the whole transcript vertically, while
+    one column only nudges the right edge — and nothing can re-wrap, since
+    every line (Claude Code's and ours) is hard-wrapped well short of full
+    width. Runs detached so the jiggle lands AFTER the tool result has
+    rendered and scrolled."""
+    if os.fork():
+        return  # ccimg continues; child daemonizes
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for stdfd in (0, 1, 2):
+        os.dup2(devnull, stdfd)
+    time.sleep(delay_ms / 1000)
+    try:
+        fd = os.open(pty, os.O_RDWR | os.O_NOCTTY)
+        rows, cols, xp, yp = struct.unpack(
+            "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols - 1, xp, yp))
+        time.sleep(0.15)
+        finish_sweep(fd, rows, cols, xp, yp)
+    finally:
+        os._exit(0)
+
+
 def placeholder_text(iid, cols, rows):
     r_, g_, b_ = (iid >> 16) & 255, (iid >> 8) & 255, iid & 255
     sgr = f"\033[38;2;{r_};{g_};{b_}m"
@@ -145,11 +197,21 @@ def placeholder_text(iid, cols, rows):
 def main():
     args = sys.argv[1:]
     verbose = os.environ.get("CCIMG_DEBUG") == "1"
+    direct = os.environ.get("CCIMG_DIRECT") == "1"
     if "-v" in args:
         verbose = True
         args.remove("-v")
+    if "--direct" in args:
+        direct = True
+        args.remove("--direct")
+    do_sweep = os.environ.get("CCIMG_NO_SWEEP") != "1"
+    if "--sweep" in args:  # legacy no-op; sweep is on by default
+        args.remove("--sweep")
+    if "--no-sweep" in args:
+        do_sweep = False
+        args.remove("--no-sweep")
     if not 1 <= len(args) <= 2:
-        die("usage: ccimg [-v] <image> [cols]")
+        die("usage: ccimg [-v] [--direct] [--no-sweep] <image> [cols]")
     img_path = args[0]
     if not os.path.isfile(img_path):
         die(f"no such file: {img_path}")
@@ -224,7 +286,7 @@ def main():
         img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+    png = buf.getvalue()
 
     # ID from the transmitted bytes + geometry: same image re-shown reuses its
     # ID; a cell is a live lookup, so an ID must never point at different
@@ -235,26 +297,63 @@ def main():
     # 3 bytes of ID space: ~4k distinct images in one terminal before a 50%
     # chance of collision, which would repaint older placeholders. Fine for a
     # session's worth of renders.
-    digest = hashlib.sha256(buf.getvalue() + f"{cols}x{rows}".encode()).digest()
+    digest = hashlib.sha256(png + f"{cols}x{rows}".encode()).digest()
     iid = int.from_bytes(digest[:3], "big") or 1
 
-    # Transmit chunked (q=2: fully quiet — responses would land in Claude's
-    # stdin), then create the virtual placement.
-    parts = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
-    out = []
-    for i, p in enumerate(parts):
-        more = 1 if i < len(parts) - 1 else 0
-        ctrl = f"a=t,f=100,i={iid},q=2,m={more}" if i == 0 else f"m={more}"
-        out.append(f"\033_G{ctrl};{p}\033\\")
+    # Transmit (q=2: fully quiet — responses would land in Claude's stdin),
+    # then create the virtual placement.
+    #
+    # Default medium is a temp file (t=t): the pty then carries only a small
+    # APC naming it, in one atomic write(2). Claude Code's renderer shares
+    # this pty and streams frames nonblocking from its event loop; flooding
+    # the pty with 100s of KB of chunked base64 (t=d) causes backpressure
+    # that can split a frame mid-escape-sequence around our chunks, and a
+    # misparsed frame paints garbage. The temp file keeps the bulk payload
+    # off the pty entirely. (NOTE: the stray statusline fragments sometimes
+    # seen near tall renders are NOT this race — they're an upstream Claude
+    # Code repaint bug, see anthropics/claude-code#17519 / #84297; Ctrl+L
+    # clears them.) ghostty/kitty require the path to contain
+    # "tty-graphics-protocol" and to live under /tmp or /dev/shm; the
+    # terminal deletes the file after reading it.
+    if direct:
+        b64 = base64.standard_b64encode(png).decode()
+        parts = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
+        out = []
+        for i, p in enumerate(parts):
+            more = 1 if i < len(parts) - 1 else 0
+            ctrl = (f"a=t,f=100,i={iid},q=2,m={more}" if i == 0
+                    else f"m={more}")
+            out.append(f"\033_G{ctrl};{p}\033\\")
+    else:
+        tf = tempfile.NamedTemporaryFile(
+            prefix="tty-graphics-protocol-ccimg-", suffix=".png",
+            dir="/tmp", delete=False)
+        with tf:
+            tf.write(png)
+        path_b64 = base64.standard_b64encode(tf.name.encode()).decode()
+        out = [f"\033_Ga=t,f=100,t=t,i={iid},q=2;{path_b64}\033\\"]
     out.append(f"\033_Ga=p,U=1,i={iid},c={cols},r={rows},q=2\033\\")
-    with open(pty, "w") as f:
-        f.write("".join(out))
-        f.flush()
+    payload = memoryview("".join(out).encode())
+    fd = os.open(pty, os.O_WRONLY | os.O_NOCTTY)
+    try:
+        while payload:
+            payload = payload[os.write(fd, payload):]
+    finally:
+        os.close(fd)
 
     if verbose:
+        medium = "direct" if direct else "tempfile"
         print(f"ccimg: {os.path.basename(img_path)} {iw}x{ih}px -> "
-              f"{cols}x{rows} cells, id={iid}, {len(b64) // 1024}KiB via {pty}")
+              f"{cols}x{rows} cells, id={iid}, {len(png) // 1024}KiB "
+              f"({medium}) via {pty}")
     print(placeholder_text(iid, cols, rows))
+
+    if do_sweep:
+        delay_ms = int(os.environ.get("CCIMG_SWEEP_MS", "500"))
+        if verbose:
+            print(f"ccimg: sweep repaint in {delay_ms}ms")
+        sys.stdout.flush()
+        spawn_sweep(pty, delay_ms)
 
 
 if __name__ == "__main__":
