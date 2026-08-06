@@ -3,7 +3,7 @@
 Render images inline in a Claude Code transcript.
 
 <p align="center">
-  <img src="demo/session.png" width="50%" alt="Claude answering a question with a chart rendered inline by ccimg">
+  <img src="demo/session.png" width="75%" alt="Claude answering a question with a chart rendered inline by ccimg">
 </p>
 
 Claude Code's TUI can't display images — when Claude wants to show you a
