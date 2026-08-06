@@ -3,8 +3,7 @@
 Render images inline in a Claude Code transcript.
 
 <p align="center">
-  <img src="demo/photo.png" width="49%" alt="ccimg rendering a photo in a Claude Code session">
-  <img src="demo/chart.png" width="49%" alt="ccimg rendering a chart in a Claude Code session">
+  <img src="demo/session.png" width="50%" alt="Claude answering a question with a chart rendered inline by ccimg">
 </p>
 
 Claude Code's TUI can't display images — when Claude wants to show you a
@@ -42,6 +41,11 @@ ccimg [-v] [--direct] [--no-sweep] <image> [cols]
   [kitty](https://sw.kovidgoyal.net/kitty/) originated it
 - Linux — the script resolves Claude's pty by walking `/proc`
 - Python 3 with [Pillow](https://pypi.org/project/pillow/)
+- A verbose Claude Code session — launch with `claude --verbose` (or set
+  `"viewMode": "verbose"` in `settings.json`). Without it Claude Code
+  collapses every tool result taller than 4 rows to 3 lines +
+  "`… +N lines`", hiding the placeholder block the image renders from;
+  `ctrl+o`'s transcript view is then the only way to see it
 
 ## Install
 
