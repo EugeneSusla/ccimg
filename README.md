@@ -41,11 +41,11 @@ ccimg [-v] [--direct] [--no-sweep] <image> [cols]
   [kitty](https://sw.kovidgoyal.net/kitty/) originated it
 - Linux — the script resolves Claude's pty by walking `/proc`
 - Python 3 with [Pillow](https://pypi.org/project/pillow/)
-- A verbose Claude Code session — launch with `claude --verbose` (or set
-  `"viewMode": "verbose"` in `settings.json`). Without it Claude Code
-  collapses every tool result taller than 4 rows to 3 lines +
-  "`… +N lines`", hiding the placeholder block the image renders from;
-  `ctrl+o`'s transcript view is then the only way to see it
+- Best with a verbose Claude Code session — launch with `claude --verbose`
+  (or set `"viewMode": "verbose"` in `settings.json`). Non-verbose sessions
+  collapse every tool result taller than 4 rows to 3 lines +
+  "`… +N lines`", hiding the placeholder block the image renders from —
+  the image is then only visible in `ctrl+o`'s transcript view
 
 ## Install
 

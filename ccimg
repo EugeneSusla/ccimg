@@ -25,11 +25,11 @@ Mechanism (kitty graphics protocol, unicode placeholders — verified in ghostty
      file transmission or ones that cannot read this machine's /tmp.
   4. Print the placeholder block (U+10EEEE + row/col diacritics, image ID in
      truecolor fg) to STDOUT. Ink renders it as ordinary tool output; ghostty
-     maps the cells to the image. Cells scroll with the transcript. The
-     session must be verbose (`claude --verbose` / viewMode "verbose"):
+     maps the cells to the image. Cells scroll with the transcript. Best
+     in a verbose session (`claude --verbose` / viewMode "verbose"):
      non-verbose sessions collapse tool results >4 rows to 3 lines, hiding
-     the placeholder block (verified against the 2.1.220 binary: Aut=3 in
-     the wrap helper next to `_5u`).
+     the placeholder block except in the ctrl+o transcript view (verified
+     against the 2.1.220 binary: Aut=3 in the wrap helper next to `_5u`).
 
 Note: the escape codes are stripped from the copy the model sees, so the tool
 result looks like literal `[38;2;...m` + placeholder runs to Claude. The image
