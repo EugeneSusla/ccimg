@@ -41,7 +41,7 @@ curl -o ~/.local/bin/ccimg https://raw.githubusercontent.com/EugeneSusla/ccimg/m
 chmod +x ~/.local/bin/ccimg
 ```
 
-Then tell Claude about it — e.g. in `~/.claude/CLAUDE.md`:
+Then tell Claude about it — e.g. in `CLAUDE.md`:
 
 ```markdown
 **Show me images with `ccimg <file> [cols]`.** Renders inline in the
