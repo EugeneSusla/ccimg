@@ -2,9 +2,10 @@
 
 Render images inline in a Claude Code transcript.
 
-![ccimg rendering a photo in a Claude Code session](demo/photo.png)
-
-![ccimg rendering a chart in a Claude Code session](demo/chart.png)
+<p align="center">
+  <img src="demo/photo.png" width="49%" alt="ccimg rendering a photo in a Claude Code session">
+  <img src="demo/chart.png" width="49%" alt="ccimg rendering a chart in a Claude Code session">
+</p>
 
 Claude Code's TUI can't display images — when Claude wants to show you a
 chart, a screenshot, or an icon, the best it can normally do is print a file
