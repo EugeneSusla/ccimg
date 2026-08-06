@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""ccimg — render an image inline in the current Claude Code transcript.
+
+Usage: ccimg [-v] <image> [cols]
+
+-v (or CCIMG_DEBUG=1) prints a diagnostic line (size, cells, id, pty);
+default output is the placeholder block only.
+
+Mechanism (kitty graphics protocol, unicode placeholders — verified in ghostty):
+  1. Resolve the Claude Code session's pty at CALL TIME by walking /proc
+     ancestry up to the claude process and reading its stdin tty. Never cached:
+     the claude process can restart mid-session and its old pty gets recycled
+     to a DIFFERENT window — a stale path paints into someone else's terminal.
+  2. Query TIOCGWINSZ on that pty for cell-grid + pixel geometry.
+  3. Transmit the (downscaled) PNG over the pty via APC escapes (invisible,
+     cursor-neutral), then create a virtual placement (U=1, aspect-fit).
+  4. Print the placeholder block (U+10EEEE + row/col diacritics, image ID in
+     truecolor fg) to STDOUT. Ink renders it as ordinary tool output; ghostty
+     maps the cells to the image. Cells scroll with the transcript.
+
+Note: the escape codes are stripped from the copy the model sees, so the tool
+result looks like literal `[38;2;...m` + placeholder runs to Claude. The image
+renders only in the user's terminal. Only a screenshot proves rendering to LLM.
+"""
+import base64
+import fcntl
+import hashlib
+import io
+import math
+import os
+import struct
+import sys
+import termios
+
+from PIL import Image, ImageOps
+
+# kitty gen/rowcolumn-diacritics.txt — 297 combining chars encoding row/col.
+DIA_HEX = (
+    "0305 030D 030E 0310 0312 033D 033E 033F 0346 034A 034B 034C 0350 0351 "
+    "0352 0357 035B 0363 0364 0365 0366 0367 0368 0369 036A 036B 036C 036D "
+    "036E 036F 0483 0484 0485 0486 0487 0592 0593 0594 0595 0597 0598 0599 "
+    "059C 059D 059E 059F 05A0 05A1 05A8 05A9 05AB 05AC 05AF 05C4 0610 0611 "
+    "0612 0613 0614 0615 0616 0617 0657 0658 0659 065A 065B 065D 065E 06D6 "
+    "06D7 06D8 06D9 06DA 06DB 06DC 06DF 06E0 06E1 06E2 06E4 06E7 06E8 06EB "
+    "06EC 0730 0732 0733 0735 0736 073A 073D 073F 0740 0741 0743 0745 0747 "
+    "0749 074A 07EB 07EC 07ED 07EE 07EF 07F0 07F1 07F3 0816 0817 0818 0819 "
+    "081B 081C 081D 081E 081F 0820 0821 0822 0823 0825 0826 0827 0829 082A "
+    "082B 082C 082D 0951 0953 0954 0F82 0F83 0F86 0F87 135D 135E 135F 17DD "
+    "193A 1A17 1A75 1A76 1A77 1A78 1A79 1A7A 1A7B 1A7C 1B6B 1B6D 1B6E 1B6F "
+    "1B70 1B71 1B72 1B73 1CD0 1CD1 1CD2 1CDA 1CDB 1CE0 1DC0 1DC1 1DC3 1DC4 "
+    "1DC5 1DC6 1DC7 1DC8 1DC9 1DCB 1DCC 1DD1 1DD2 1DD3 1DD4 1DD5 1DD6 1DD7 "
+    "1DD8 1DD9 1DDA 1DDB 1DDC 1DDD 1DDE 1DDF 1DE0 1DE1 1DE2 1DE3 1DE4 1DE5 "
+    "1DE6 1DFE 20D0 20D1 20D4 20D5 20D6 20D7 20DB 20DC 20E1 20E7 20E9 20F0 "
+    "2CEF 2CF0 2CF1 2DE0 2DE1 2DE2 2DE3 2DE4 2DE5 2DE6 2DE7 2DE8 2DE9 2DEA "
+    "2DEB 2DEC 2DED 2DEE 2DEF 2DF0 2DF1 2DF2 2DF3 2DF4 2DF5 2DF6 2DF7 2DF8 "
+    "2DF9 2DFA 2DFB 2DFC 2DFD 2DFE 2DFF A66F A67C A67D A6F0 A6F1 A8E0 A8E1 "
+    "A8E2 A8E3 A8E4 A8E5 A8E6 A8E7 A8E8 A8E9 A8EA A8EB A8EC A8ED A8EE A8EF "
+    "A8F0 A8F1 AAB0 AAB2 AAB3 AAB7 AAB8 AABE AABF AAC1 FE20 FE21 FE22 FE23 "
+    "FE24 FE25 FE26 10A0F 10A38 1D185 1D186 1D187 1D188 1D189 1D1AA 1D1AB "
+    "1D1AC 1D1AD 1D242 1D243 1D244"
+)
+DIA = [chr(int(h, 16)) for h in DIA_HEX.split()]
+PLC = "\U0010EEEE"
+
+# Claude Code's tool-result renderer hard-wraps content lines at
+# (terminal columns - 10) MEASURED width — verified against the binary
+# (wrap helper's `_5u = 10`) and empirically (106-col terminal: 96-char
+# plain line displays unwrapped, 98 wraps). A wrapped placeholder line
+# breaks the image grid. Note: shrinking the terminal window after a
+# render re-wraps old lines and tears past images anyway — no margin can
+# prevent that.
+#
+# Crucially the renderer measures via Bun.stringWidth, which counts most
+# kitty diacritics past index 29 as width 1 (not the 0 a terminal gives a
+# combining mark), so a placeholder cell measures 1 + w[row] + w[col],
+# not 1. DIA_W below is Bun.stringWidth's per-index width for each DIA
+# entry (measured against bun 1.2, ambiguousIsNarrow — same options as
+# the binary). Cols are capped so every emitted line's MEASURED width
+# fits the budget; in a 106-col terminal that lands at 63 image columns.
+INK_MARGIN = 10
+DIA_W = (
+    "000000000000000000000000000000111111111111111111111111111111"
+    "111111111111111111111111111111111111111111111111111111111111"
+    "111111111000111111111111111111111111111111110000000000000000"
+    "000000000000000000000000000000111111111111111111111111111111"
+    "111111111111111111111111111111111111000000011111111111111"
+)
+CHUNK = 4096
+
+
+def die(msg):
+    print(f"ccimg: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def find_claude_pty():
+    """Walk /proc ancestry to the claude process; return its stdin pty path."""
+    pid = os.getpid()
+    chain = []
+    for _ in range(40):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+            comm = stat[stat.index("(") + 1:stat.rindex(")")]
+            ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError) as e:
+            die(f"cannot read /proc/{pid}/stat ({e}); ancestry walk failed")
+        chain.append(f"{pid}({comm})")
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            exe = ""
+        if comm == "claude" or exe.endswith("/bin/claude"):
+            try:
+                tty = os.readlink(f"/proc/{pid}/fd/0")
+            except OSError as e:
+                die(f"claude process pid={pid} found but fd/0 unreadable ({e})")
+            if not tty.startswith("/dev/pts/"):
+                die(f"claude pid={pid} stdin is {tty!r}, not a pty")
+            return tty
+        if ppid <= 1:
+            break
+        pid = ppid
+    die("no claude process in ancestry: " + " <- ".join(chain))
+
+
+def winsz(pty):
+    fd = os.open(pty, os.O_RDONLY | os.O_NOCTTY)
+    try:
+        rows, cols, xpix, ypix = struct.unpack(
+            "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+    finally:
+        os.close(fd)
+    return rows, cols, xpix, ypix
+
+
+def placeholder_text(iid, cols, rows):
+    r_, g_, b_ = (iid >> 16) & 255, (iid >> 8) & 255, iid & 255
+    sgr = f"\033[38;2;{r_};{g_};{b_}m"
+    return "\n".join(
+        sgr + "".join(PLC + DIA[r] + DIA[c] for c in range(cols)) + "\033[39m"
+        for r in range(rows))
+
+
+def main():
+    args = sys.argv[1:]
+    verbose = os.environ.get("CCIMG_DEBUG") == "1"
+    if "-v" in args:
+        verbose = True
+        args.remove("-v")
+    if not 1 <= len(args) <= 2:
+        die("usage: ccimg [-v] <image> [cols]")
+    img_path = args[0]
+    if not os.path.isfile(img_path):
+        die(f"no such file: {img_path}")
+    user_cols = None
+    if len(args) == 2:
+        try:
+            user_cols = int(args[1])
+        except ValueError:
+            die(f"cols must be an integer, got {args[1]!r}")
+        if user_cols < 1:
+            die(f"cols must be >= 1, got {user_cols}")
+
+    pty = find_claude_pty()
+    trows, tcols, xpix, ypix = winsz(pty)
+    if not (trows and tcols):
+        die(f"TIOCGWINSZ on {pty} returned empty grid")
+    # Cell pixel size; ghostty reports both. Fallback to typical metrics.
+    cellw = xpix / tcols if xpix else 9.0
+    cellh = ypix / trows if ypix else 17.0
+
+    try:
+        img = Image.open(img_path)
+        # Phone photos carry rotation in EXIF only: without this they render
+        # sideways AND the aspect math below uses the wrong dimensions.
+        img = ImageOps.exif_transpose(img)
+    except Exception as e:
+        die(f"cannot open {img_path}: {e}")
+    iw, ih = img.size
+    # Natural size in cells — never blow a 48px icon up to full width.
+    natural_cols = max(1, math.ceil(iw / cellw))
+
+    budget = max(4, tcols - INK_MARGIN)
+
+    def max_cols_for(row_extra):
+        # Largest N cells whose MEASURED line width (each cell = base 1 +
+        # row-diacritic width + col-diacritic width) fits the budget.
+        used, n = 0, 0
+        for c in range(len(DIA_W)):
+            used += 1 + row_extra + int(DIA_W[c])
+            if used > budget:
+                break
+            n = c + 1
+        return max(1, n)
+
+    max_rows = max(2, trows - 6)
+    # Fixpoint over the row-diacritic penalty: tall placements use row
+    # diacritics that themselves measure 1, widening every cell of those
+    # lines. Converges in <= 2 passes (row_extra only steps 0 -> 1).
+    row_extra = 0
+    for _ in range(3):
+        max_cols = max_cols_for(row_extra)
+        # An explicit width is honoured up to the wrap budget; without one,
+        # don't upscale past the image's own resolution.
+        cols = min(user_cols, max_cols) if user_cols else min(natural_cols, max_cols)
+        cols = max(1, cols)
+        # Placement box matches image aspect so the aspect-fit placement has
+        # no letterbox. rows from cols via pixel aspect.
+        rows = max(1, round(cols * cellw * ih / (iw * cellh)))
+        if rows > max_rows:
+            rows = max_rows
+            cols = max(1, min(round(rows * cellh * iw / (ih * cellw)), max_cols))
+        worst = max(int(w) for w in DIA_W[:rows])
+        if worst == row_extra:
+            break
+        row_extra = worst
+    if rows > len(DIA) or cols > len(DIA):
+        die(f"placement {cols}x{rows} exceeds diacritic table ({len(DIA)})")
+
+    # Downscale to placement pixel size x2 (hidpi), encode PNG.
+    img.thumbnail((int(cols * cellw * 2), int(rows * cellh * 2)), Image.LANCZOS)
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+    # ID from the transmitted bytes + geometry: same image re-shown reuses its
+    # ID; a cell is a live lookup, so an ID must never point at different
+    # content. Hashing the encoded PNG rather than re-reading the file keeps
+    # the ID keyed to what was actually sent (a file swapped mid-run can't
+    # desync them) and saves a read. Geometry stays an explicit salt because
+    # the downscale is a no-op for images already smaller than the placement.
+    # 3 bytes of ID space: ~4k distinct images in one terminal before a 50%
+    # chance of collision, which would repaint older placeholders. Fine for a
+    # session's worth of renders.
+    digest = hashlib.sha256(buf.getvalue() + f"{cols}x{rows}".encode()).digest()
+    iid = int.from_bytes(digest[:3], "big") or 1
+
+    # Transmit chunked (q=2: fully quiet — responses would land in Claude's
+    # stdin), then create the virtual placement.
+    parts = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
+    out = []
+    for i, p in enumerate(parts):
+        more = 1 if i < len(parts) - 1 else 0
+        ctrl = f"a=t,f=100,i={iid},q=2,m={more}" if i == 0 else f"m={more}"
+        out.append(f"\033_G{ctrl};{p}\033\\")
+    out.append(f"\033_Ga=p,U=1,i={iid},c={cols},r={rows},q=2\033\\")
+    with open(pty, "w") as f:
+        f.write("".join(out))
+        f.flush()
+
+    if verbose:
+        print(f"ccimg: {os.path.basename(img_path)} {iw}x{ih}px -> "
+              f"{cols}x{rows} cells, id={iid}, {len(b64) // 1024}KiB via {pty}")
+    print(placeholder_text(iid, cols, rows))
+
+
+if __name__ == "__main__":
+    main()
